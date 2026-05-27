@@ -1,0 +1,1 @@
+gcc cmd/main.c internal/net.c internal/tcp/server.c -Wall -Wextra -Werror -g -o bin/sprout

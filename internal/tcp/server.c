@@ -1,6 +1,6 @@
 #include "server.h"
 
-#include <stdbool.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,23 +9,27 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define MIN_CAP 4
+#include "../slice.h"
+
+#define SPROUT_MIN_CAP 4
 
 struct Server {
-    int      fd;
-    Conn *conns;
-    uint64_t len;
-    uint64_t cap;
+    int         fd;
+    Addr        addr;
+    slice(Conn) conns;
 };
 
 struct Conn {
-    int fd;
+    int  fd;
+    Addr addr;
+    int  err;
 };
 
-Conn *server_append(Server *server, int fd);
-Addr get_addr(int fd);
+Conn *server_append__(Server *server, Conn conn);
+Addr  addr_make__(int fd);
+Addr  addr_get__(struct sockaddr_in, socklen_t);
 
-Server *server_new(Addr addr, uint64_t cap) {
+Server *server_new(Addr addr, size_t cap) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return NULL;
@@ -52,11 +56,12 @@ Server *server_new(Addr addr, uint64_t cap) {
     }
 
     server->fd = fd;
+    server->addr = addr_make__(fd);
     return server;
 }
 
 Addr server_addr(Server *server) {
-    return get_addr(server->fd);
+    return server->addr;
 }
 
 Conn *server_accept(Server *server) {
@@ -68,7 +73,11 @@ Conn *server_accept(Server *server) {
         return NULL;
     }
 
-    Conn *conn = server_append(server, fd);
+    Conn c;
+    c.fd = fd;
+    c.addr = addr_get__(addr, addrlen);
+
+    Conn *conn = server_append__(server, c);
     if (conn == NULL) {
         close(fd);
         return NULL;
@@ -77,69 +86,82 @@ Conn *server_accept(Server *server) {
     return conn;
 }
 
-Conn *server_append(Server *server, int fd) {
-    Conn conn;
-    conn.fd = fd;
-
-    for (uint64_t i = 0; i < server->len; i++) {
-        if (server->conns[i].fd == -1) {
-            server->conns[i] = conn;
-            return server->conns + i;
+Conn *server_append__(Server *server, Conn conn) {
+    for (size_t i = 0; i < len(Conn, server->conns); i++) {
+        Conn *slot = &at(Conn, server->conns, i);
+        if (slot->fd == -1) {
+            *slot = conn;
+            return slot;
         }
     }
 
-    if (server->cap <= server->len) {
-        uint64_t cap = 2 * server->cap;
-        if (cap < MIN_CAP) {
-            cap = MIN_CAP;
-        }
-
-        Conn *conns = calloc(cap, sizeof(Conn));
-        if (conns == NULL) {
-            return NULL;
-        }
-
-        if (server->conns != NULL) {
-            memcpy(conns, server->conns, server->len);
-            free(server->conns);
-        }
-
-        server->conns = conns;
-        server->cap = cap;
-    }
-
-    Conn *spot = server->conns + server->len;
-    *spot = conn;
-    server->len++;
-
-    return spot;
+    server->conns = append(Conn, server->conns, conn);
+    return &at(Conn, server->conns, len(Conn, server->conns) - 1);
 }
 
 void server_close(Server *server) {
-    for (uint64_t i = 0; i < server->len; i++) {
-        if (server->conns[i].fd != -1) {
-            close(server->conns[i].fd);
+    for (size_t i = 0; i < len(Conn, server->conns); i++) {
+        Conn conn = at(Conn, server->conns, i);
+        if (conn.fd != -1) {
+            close(conn.fd);
         }
     }
-    free(server->conns);
 
+    release(Conn, server->conns);
     close(server->fd);
     free(server);
 }
 
 Addr conn_addr(Conn *conn) {
-    return get_addr(conn->fd);
+    return conn->addr;
 }
 
-uint64_t conn_write(Conn *conn, const char *buf, uint64_t len);
-uint64_t conn_read(Conn *conn, char *buf, uint64_t len);
+size_t conn_write(Conn *conn, const char *buf, size_t len) {
+    if (len <= 0) {
+        conn->err = 0;
+        return 0;
+    }
+
+    int n = write(conn->fd, buf, len);
+    if (n < 0) {
+        conn->err = errno;
+        return 0;
+    }
+
+    conn->err = 0;
+    return n;
+}
+
+size_t conn_read(Conn *conn, char *buf, size_t len) {
+    if (len <= 0) {
+        conn->err = 0;
+        return 0;
+    }
+
+    int n = read(conn->fd, buf, len);
+    if (n == 0) {
+        conn->err = EOF;
+        return 0;
+    }
+    if (n < 0) {
+        conn->err = errno;
+        return 0;
+    }
+
+    conn->err = 0;
+    return n;
+}
+
+int conn_error(Conn *conn) {
+    return conn->err;
+}
 
 void conn_close(Conn *conn) {
     close(conn->fd);
     conn->fd = -1;
 }
 
-Addr get_addr(int fd) {
+Addr addr_make__(int fd) {
     struct sockaddr_in addr_in;
     socklen_t addrlen = sizeof(struct sockaddr_in);
 
@@ -148,6 +170,10 @@ Addr get_addr(int fd) {
         return invalid;
     }
 
+    return addr_get__(addr_in, addrlen);
+}
+
+Addr addr_get__(struct sockaddr_in addr_in, socklen_t addrlen) {
     if (addrlen != sizeof(struct sockaddr_in)) {
         return invalid;
     }
